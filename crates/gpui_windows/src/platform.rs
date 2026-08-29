@@ -221,6 +221,15 @@ impl WindowsPlatform {
             .and_then(|hwnd| window_from_hwnd(hwnd.as_raw()))
     }
 
+    fn hwnd_for_window(&self, handle: AnyWindowHandle) -> Option<HWND> {
+        self.raw_window_handles.read().iter().find_map(|entry| {
+            let hwnd = entry.as_raw();
+            window_from_hwnd(hwnd)
+                .filter(|window| window.handle == handle)
+                .map(|_| hwnd)
+        })
+    }
+
     #[inline]
     fn post_message(&self, message: u32, wparam: WPARAM, lparam: LPARAM) {
         self.raw_window_handles
@@ -576,7 +585,15 @@ impl Platform for WindowsPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
+        let parent_hwnd = match &options.kind {
+            WindowKind::AnchoredPopup(options) => Some(
+                self.hwnd_for_window(options.parent)
+                    .context("anchored popup parent window is not open")?,
+            ),
+            _ => None,
+        };
+        let window =
+            WindowsWindow::new(handle, options, self.generate_creation_info(), parent_hwnd)?;
         let handle = window.get_raw_handle();
         self.raw_window_handles.write().push(handle.into());
 

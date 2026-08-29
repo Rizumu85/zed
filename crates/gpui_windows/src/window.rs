@@ -88,6 +88,7 @@ pub struct WindowsWindowState {
     initial_placement: Cell<Option<WindowOpenStatus>>,
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
+    show_after_background_update: Cell<bool>,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -120,6 +121,7 @@ impl WindowsWindowState {
         disable_direct_composition: bool,
         invalidate_devices: Arc<AtomicBool>,
         draw_coordinator: Rc<DrawCoordinator>,
+        show_after_background_update: bool,
     ) -> Result<Self> {
         let scale_factor = {
             let monitor_dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
@@ -186,6 +188,7 @@ impl WindowsWindowState {
             draw_coordinator,
             direct_manipulation,
             a11y: RefCell::new(None),
+            show_after_background_update: Cell::new(show_after_background_update),
         })
     }
 
@@ -262,6 +265,7 @@ impl WindowsWindowInner {
             context.disable_direct_composition,
             context.invalidate_devices.clone(),
             context.draw_coordinator.clone(),
+            context.show_after_background_update,
         )?;
 
         Ok(Rc::new(Self {
@@ -411,6 +415,7 @@ struct WindowCreateContext {
     invalidate_devices: Arc<AtomicBool>,
     draw_coordinator: Rc<DrawCoordinator>,
     parent_hwnd: Option<HWND>,
+    show_after_background_update: bool,
 }
 
 impl WindowsWindow {
@@ -418,12 +423,12 @@ impl WindowsWindow {
         handle: AnyWindowHandle,
         params: WindowParams,
         creation_info: WindowCreationInfo,
+        anchored_popup_parent: Option<HWND>,
     ) -> Result<Self> {
-        // Native popups are not implemented on Windows yet. Rejecting lets callers fall back to
-        // gpui's in-window popovers.
-        if let WindowKind::AnchoredPopup(_) = params.kind {
-            return Err(popup::PopupNotSupportedError.into());
-        }
+        let anchored_popup = match &params.kind {
+            WindowKind::AnchoredPopup(options) => Some(options.clone()),
+            _ => None,
+        };
 
         let WindowCreationInfo {
             icon,
@@ -440,7 +445,12 @@ impl WindowsWindow {
             draw_coordinator,
         } = creation_info;
         register_window_class(icon);
-        let parent_hwnd = if params.kind == WindowKind::Dialog {
+        let parent_hwnd = if anchored_popup.is_some() {
+            Some(
+                anchored_popup_parent
+                    .context("anchored popup parent window handle is unavailable")?,
+            )
+        } else if params.kind == WindowKind::Dialog {
             let parent_window = unsafe { GetActiveWindow() };
             if parent_window.is_invalid() {
                 None
@@ -468,7 +478,13 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
-        let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
+        let (mut dwexstyle, dwstyle) = if let Some(options) = &anchored_popup {
+            let mut extended_style = WS_EX_TOOLWINDOW;
+            if !options.grab {
+                extended_style |= WS_EX_NOACTIVATE;
+            }
+            (extended_style, WS_POPUP)
+        } else if params.kind == WindowKind::PopUp {
             (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WINDOW_STYLE(0x0))
         } else {
             let mut dwstyle = WS_SYSMENU;
@@ -494,13 +510,23 @@ impl WindowsWindow {
         }
 
         let hinstance = get_module_handle();
-        let display = if let Some(display_id) = params.display_id {
-            WindowsDisplay::new(display_id)
-        } else {
-            None
-        }
-        .or_else(WindowsDisplay::primary_monitor)
-        .context("failed to find any monitor")?;
+        let display = parent_hwnd
+            .filter(|_| anchored_popup.is_some())
+            .and_then(|parent_hwnd| {
+                let monitor = unsafe { MonitorFromWindow(parent_hwnd, MONITOR_DEFAULTTONEAREST) };
+                (!monitor.is_invalid())
+                    .then(|| WindowsDisplay::new(WindowsDisplay::display_id_for_monitor(monitor)))?
+            })
+            .or_else(|| params.display_id.and_then(WindowsDisplay::new))
+            .or_else(WindowsDisplay::primary_monitor)
+            .context("failed to find any monitor")?;
+        let placement_bounds =
+            if let (Some(options), Some(parent_hwnd)) = (anchored_popup.as_ref(), parent_hwnd) {
+                resolve_anchored_popup_bounds(parent_hwnd, display, options, params.bounds)?
+            } else {
+                params.bounds
+            };
+        let show_after_background_update = anchored_popup.is_some() && params.show;
         let appearance = system_appearance().unwrap_or_default();
         let mut context = WindowCreateContext {
             inner: None,
@@ -524,6 +550,7 @@ impl WindowsWindow {
             invalidate_devices,
             draw_coordinator,
             parent_hwnd,
+            show_after_background_update,
         };
         let creation_result = unsafe {
             CreateWindowExW(
@@ -553,8 +580,8 @@ impl WindowsWindow {
         configure_dwm_dark_mode(hwnd, appearance);
         this.state.border_offset.update(hwnd)?;
         let placement =
-            retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
-        if params.show {
+            retrieve_window_placement(hwnd, display, placement_bounds, &this.state.border_offset)?;
+        if params.show && !show_after_background_update {
             let mut placement = placement;
             if !params.focus {
                 placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
@@ -894,6 +921,10 @@ impl PlatformWindow for WindowsWindow {
                 // DWMSBT_TABBEDWINDOW => MicaAlt
                 dwm_set_window_composition_attribute(hwnd, 4);
             }
+        }
+
+        if self.state.show_after_background_update.replace(false) {
+            self.0.set_window_placement().log_err();
         }
     }
 
@@ -1470,6 +1501,169 @@ fn register_drag_drop(window: &Rc<WindowsWindowInner>) -> Result<()> {
             .context("unable to register drag-drop event")?;
     }
     Ok(())
+}
+
+fn resolve_anchored_popup_bounds(
+    parent_hwnd: HWND,
+    display: WindowsDisplay,
+    options: &popup::PopupOptions,
+    requested_bounds: Bounds<Pixels>,
+) -> Result<Bounds<Pixels>> {
+    let parent_scale_factor =
+        unsafe { GetDpiForWindow(parent_hwnd) } as f32 / USER_DEFAULT_SCREEN_DPI as f32;
+    let popup_scale_factor = display.scale_factor();
+    let mut parent_client_origin = POINT::default();
+    unsafe { ClientToScreen(parent_hwnd, &mut parent_client_origin) }
+        .ok()
+        .context("failed to locate anchored popup parent client area")?;
+
+    let anchor_left =
+        parent_client_origin.x as f32 + options.anchor_rect.origin.x.as_f32() * parent_scale_factor;
+    let anchor_top =
+        parent_client_origin.y as f32 + options.anchor_rect.origin.y.as_f32() * parent_scale_factor;
+    let anchor_width = options.anchor_rect.size.width.as_f32() * parent_scale_factor;
+    let anchor_height = options.anchor_rect.size.height.as_f32() * parent_scale_factor;
+    let (anchor_x_factor, anchor_y_factor) = popup_anchor_factors(options.anchor);
+    let (gravity_x_factor, gravity_y_factor) = popup_gravity_factors(options.gravity);
+    let offset_x = options.offset.x.as_f32() * parent_scale_factor;
+    let offset_y = options.offset.y.as_f32() * parent_scale_factor;
+    let mut popup_width = requested_bounds.size.width.as_f32() * popup_scale_factor;
+    let mut popup_height = requested_bounds.size.height.as_f32() * popup_scale_factor;
+
+    let mut popup_left =
+        anchor_left + anchor_width * anchor_x_factor + popup_width * gravity_x_factor + offset_x;
+    let mut popup_top =
+        anchor_top + anchor_height * anchor_y_factor + popup_height * gravity_y_factor + offset_y;
+
+    let visible_bounds = display
+        .visible_bounds()
+        .to_device_pixels(popup_scale_factor);
+    let visible_left = visible_bounds.left().0 as f32;
+    let visible_top = visible_bounds.top().0 as f32;
+    let visible_right = visible_bounds.right().0 as f32;
+    let visible_bottom = visible_bounds.bottom().0 as f32;
+
+    if options
+        .constraint_adjustment
+        .contains(popup::PopupConstraintAdjustment::FLIP_X)
+    {
+        let flipped_left = anchor_left
+            + anchor_width * (1.0 - anchor_x_factor)
+            + popup_width * (-1.0 - gravity_x_factor)
+            + offset_x;
+        if popup_axis_overflow(flipped_left, popup_width, visible_left, visible_right)
+            < popup_axis_overflow(popup_left, popup_width, visible_left, visible_right)
+        {
+            popup_left = flipped_left;
+        }
+    }
+
+    if options
+        .constraint_adjustment
+        .contains(popup::PopupConstraintAdjustment::FLIP_Y)
+    {
+        let flipped_top = anchor_top
+            + anchor_height * (1.0 - anchor_y_factor)
+            + popup_height * (-1.0 - gravity_y_factor)
+            + offset_y;
+        if popup_axis_overflow(flipped_top, popup_height, visible_top, visible_bottom)
+            < popup_axis_overflow(popup_top, popup_height, visible_top, visible_bottom)
+        {
+            popup_top = flipped_top;
+        }
+    }
+
+    if options
+        .constraint_adjustment
+        .contains(popup::PopupConstraintAdjustment::RESIZE_X)
+        && popup_axis_overflow(popup_left, popup_width, visible_left, visible_right) > 0.0
+    {
+        let resized_left = popup_left.max(visible_left);
+        let resized_right = (popup_left + popup_width).min(visible_right);
+        if resized_right > resized_left {
+            popup_left = resized_left;
+            popup_width = resized_right - resized_left;
+        }
+    }
+
+    if options
+        .constraint_adjustment
+        .contains(popup::PopupConstraintAdjustment::RESIZE_Y)
+        && popup_axis_overflow(popup_top, popup_height, visible_top, visible_bottom) > 0.0
+    {
+        let resized_top = popup_top.max(visible_top);
+        let resized_bottom = (popup_top + popup_height).min(visible_bottom);
+        if resized_bottom > resized_top {
+            popup_top = resized_top;
+            popup_height = resized_bottom - resized_top;
+        }
+    }
+
+    if options
+        .constraint_adjustment
+        .contains(popup::PopupConstraintAdjustment::SLIDE_X)
+    {
+        popup_left = clamp_popup_axis(popup_left, popup_width, visible_left, visible_right);
+    }
+    if options
+        .constraint_adjustment
+        .contains(popup::PopupConstraintAdjustment::SLIDE_Y)
+    {
+        popup_top = clamp_popup_axis(popup_top, popup_height, visible_top, visible_bottom);
+    }
+
+    Ok(Bounds {
+        origin: point(
+            px(popup_left / popup_scale_factor),
+            px(popup_top / popup_scale_factor),
+        ),
+        size: size(
+            px(popup_width / popup_scale_factor),
+            px(popup_height / popup_scale_factor),
+        ),
+    })
+}
+
+fn popup_anchor_factors(anchor: popup::PopupAnchor) -> (f32, f32) {
+    use popup::PopupAnchor::*;
+    match anchor {
+        Center => (0.5, 0.5),
+        Top => (0.5, 0.0),
+        Bottom => (0.5, 1.0),
+        Left => (0.0, 0.5),
+        Right => (1.0, 0.5),
+        TopLeft => (0.0, 0.0),
+        BottomLeft => (0.0, 1.0),
+        TopRight => (1.0, 0.0),
+        BottomRight => (1.0, 1.0),
+    }
+}
+
+fn popup_gravity_factors(gravity: popup::PopupGravity) -> (f32, f32) {
+    use popup::PopupGravity::*;
+    match gravity {
+        Center => (-0.5, -0.5),
+        Top => (-0.5, -1.0),
+        Bottom => (-0.5, 0.0),
+        Left => (-1.0, -0.5),
+        Right => (0.0, -0.5),
+        TopLeft => (-1.0, -1.0),
+        BottomLeft => (-1.0, 0.0),
+        TopRight => (0.0, -1.0),
+        BottomRight => (0.0, 0.0),
+    }
+}
+
+fn popup_axis_overflow(origin: f32, size: f32, minimum: f32, maximum: f32) -> f32 {
+    (minimum - origin).max(0.0) + (origin + size - maximum).max(0.0)
+}
+
+fn clamp_popup_axis(origin: f32, size: f32, minimum: f32, maximum: f32) -> f32 {
+    if size >= maximum - minimum {
+        minimum
+    } else {
+        origin.clamp(minimum, maximum - size)
+    }
 }
 
 fn calculate_window_rect(bounds: Bounds<DevicePixels>, border_offset: &WindowBorderOffset) -> RECT {
