@@ -478,9 +478,9 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
-        let (mut dwexstyle, dwstyle) = if let Some(options) = &anchored_popup {
+        let (mut dwexstyle, dwstyle) = if anchored_popup.is_some() {
             let mut extended_style = WS_EX_TOOLWINDOW;
-            if !options.grab {
+            if !params.focus {
                 extended_style |= WS_EX_NOACTIVATE;
             }
             (extended_style, WS_POPUP)
